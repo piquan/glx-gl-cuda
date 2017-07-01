@@ -15,6 +15,7 @@
 
 #define FPS 30
 #define MAX_SHADER_LEN 65536
+#define NREDS 1024
 
 #define WIDTH 800
 #define HEIGHT 800
@@ -50,7 +51,7 @@ struct reds_buffer
     struct {
         GLfloat red;
         GLfloat unused[3];
-    } reds[256];
+    } reds[NREDS];
 };
 
 static void
@@ -115,7 +116,7 @@ start_gl(struct resources *rsrc)
     vInfo = glXGetVisualFromFBConfig(rsrc->dpy, fbConfigs[0]);
 
     swa.border_pixel = 0;
-    swa.event_mask = StructureNotifyMask;
+    swa.event_mask = StructureNotifyMask | ButtonPressMask | KeyPressMask;
     swa.colormap = XCreateColormap(rsrc->dpy,
                                    RootWindow(rsrc->dpy, vInfo->screen),
                                    vInfo->visual, AllocNone);
@@ -126,14 +127,17 @@ start_gl(struct resources *rsrc)
                          0, 0, WIDTH, HEIGHT,
                          0, vInfo->depth, InputOutput, vInfo->visual,
                          swaMask, &swa);
+    XStoreName(rsrc->dpy, xWin, "Blending CUDA and OpenGL");
 
     /* Create a GLX context for OpenGL rendering */
     int context_attribs[] = {
         GLX_CONTEXT_MAJOR_VERSION_ARB, 3,
         GLX_CONTEXT_MINOR_VERSION_ARB, 2,
-        //GLX_CONTEXT_FLAGS_ARB, GLX_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB,
         None
     };
+    /* I can't initialize GLXEW yet because I don't have a context.
+     * That means that I need to get the glXCreateContextAttribsARB
+     * address myself. */
     typedef GLXContext (*glXCreateContextAttribsARBProc)
         (Display*, GLXFBConfig, GLXContext, Bool, const int*);
     glXCreateContextAttribsARBProc glXCreateContextAttribsARB =
@@ -142,7 +146,7 @@ start_gl(struct resources *rsrc)
     rsrc->context = glXCreateContextAttribsARB(rsrc->dpy, fbConfigs[0], NULL,
                                                True, context_attribs);
     /*
-      Alternative for getting an OpenGL 1.2 context:
+      Alternative for getting an OpenGL 2 context:
     context = glXCreateNewContext(rsrc->dpy, fbConfigs[0], GLX_RGBA_TYPE,
                                   NULL, True);
     */
@@ -166,7 +170,7 @@ start_gl(struct resources *rsrc)
         fprintf(stderr, "GLEW error: %s\n", glewGetErrorString(err));
         exit(EXIT_FAILURE);
     }
-    // GLEW can leave an error in the context, so clear it.
+    // GLEW's probes can leave an error in the context, so clear it.
     glGetError();
     // This is kinda redundant here, but I'm leaving it.
     GL_ERRCHK();
@@ -302,11 +306,11 @@ initialize_gl_resources(struct resources *rsrc)
         GLubyte blue;
     } vertices[4] = {
         // This array shows all the vertices we'll use in this program.
-        // We'll talk about the order in which they're drawn in the main
+        // We'll talk about the order in which they're used in the main
         // loop, but for now, note that these are conveniently arranged
         // in clockwise order starting with quadrant I.
-        {{  1.0,  1.0, 0.0 }, 255},
-        {{ -1.0,  1.0, 0.0 }, 0},
+        {{  1.0,  1.0, 0.0 }, 0},
+        {{ -1.0,  1.0, 0.0 }, 255},
         {{ -1.0, -1.0, 0.0 }, 0},
         {{  1.0, -1.0, 0.0 }, 255},
     };
@@ -339,7 +343,7 @@ initialize_gl_resources(struct resources *rsrc)
                              offsetof(struct vertex, blue));
         glVertexAttribBinding(blue_attr, vbo_idx);
     } else {
-        abort();
+        fprintf(stderr, "Huh, I'm not using ARB_vertex_attrib_binding.\n");
         glVertexAttribPointer(position_attr, 3, GL_FLOAT, GL_FALSE,
                               sizeof(struct vertex),
                               reinterpret_cast<void*>(
@@ -366,11 +370,6 @@ initialize_gl_resources(struct resources *rsrc)
     // we'll just set up the object, and let the main loop upload the
     // indices.
     glGenBuffers(1, &rsrc->gl_element_buffer);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rsrc->gl_element_buffer);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 3 * sizeof(GLuint), // Size to allocate
-                 NULL,               // Don't upload data right now
-                 GL_DYNAMIC_DRAW);   // We'll change it sometimes
     GL_ERRCHK();
 
     /*
@@ -394,13 +393,15 @@ initialize_gl_resources(struct resources *rsrc)
     
     GLint is_linked = 0;
     glGetProgramiv(rsrc->gl_program, GL_LINK_STATUS, &is_linked);
+    GLint max_length = 0;
+    glGetProgramiv(rsrc->gl_program, GL_INFO_LOG_LENGTH, &max_length);
+    GLchar error_log[max_length];
+    glGetProgramInfoLog(rsrc->gl_program, max_length, &max_length, error_log);
     if (is_linked == GL_FALSE) {
-        GLint max_length = 0;
-        glGetProgramiv(rsrc->gl_program, GL_INFO_LOG_LENGTH, &max_length);
-        GLchar error_log[max_length];
-        glGetProgramInfoLog(rsrc->gl_program, max_length, &max_length, error_log);
         fprintf(stderr, "Shader link error:\n%s", error_log);
         exit(EXIT_FAILURE);
+    } else if (max_length) {
+        fprintf(stderr, "Shader link messages:\n%s", error_log);
     }
 
     glDetachShader(rsrc->gl_program, vertex_shader);
@@ -433,8 +434,10 @@ calculate_reds_kernel(struct reds_buffer* reds_block,
                       unsigned long long time)
 {
     int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    float theta = float(time) + float(thread_id);
-    reds_block->reds[thread_id].red = pow(sinf(theta / 10.0), 2);
+    if (thread_id < NREDS) {
+        float theta = sinf(float(time) / 8.0) + float(thread_id) / 64.0;
+        reds_block->reds[thread_id].red = pow(sinf(theta), 2);
+    }
 }
 
 static void
@@ -451,7 +454,7 @@ calculate_reds(struct resources *rsrc, unsigned long long time)
     CUDA_ERRCHK();
     assert(devptr_size == sizeof(struct reds_buffer));
     // Launch the kernel.
-    calculate_reds_kernel<<<1, 256>>>(devptr, time);
+    calculate_reds_kernel<<<16, NREDS / 16>>>(devptr, time);
     CUDA_ERRCHK();
     // Unmap the uniform buffer so it's available to OpenGL again.  (This
     // includes an implicit sync point.)
@@ -460,10 +463,22 @@ calculate_reds(struct resources *rsrc, unsigned long long time)
 }
 
 static void
-draw_frame(struct resources *rsrc, const GLuint* vertices,
-           size_t vertices_size, unsigned long long time)
+load_elements(struct resources *rsrc, const GLuint* vertices,
+              size_t vertices_size)
 {
-    // Activate our context, shaders and VAO.  (Not technically
+    glXMakeContextCurrent(rsrc->dpy, rsrc->glxWin, rsrc->glxWin, rsrc->context);
+    glBindVertexArray(rsrc->gl_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, rsrc->gl_vertex_buffer);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rsrc->gl_element_buffer);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, vertices_size, vertices,
+                 GL_DYNAMIC_DRAW);
+    GL_ERRCHK();
+}
+
+static void
+draw_frame(struct resources *rsrc, GLsizei nvertices, unsigned long long time)
+{
+    // Activate our context, shaders, and VAO.  (Not technically
     // necessary here, since they've been activated all along, but
     // it's always prudent to refresh the context on each drawing in a
     // big program.)
@@ -475,21 +490,33 @@ draw_frame(struct resources *rsrc, const GLuint* vertices,
     glUniform1f(rsrc->gl_time_uniform_loc, float(time) / FPS);
     GL_ERRCHK();
 
-    // Upload a fresh set of indices.
-    // Bind our buffer and upload the new data.
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rsrc->gl_element_buffer);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, vertices_size, vertices,
-                 GL_DYNAMIC_DRAW);
-    GL_ERRCHK();
-
     // Start drawing
     glClearColor(0.0, 0.0, 0.0, 1.0);
     glClear(GL_COLOR_BUFFER_BIT);
-    glDrawElements(GL_TRIANGLE_STRIP, vertices_size / sizeof(*vertices),
-                   GL_UNSIGNED_INT, 0);
+    glDrawElements(GL_TRIANGLE_STRIP, nvertices, GL_UNSIGNED_INT, 0);
     glFlush();
     glXSwapBuffers(rsrc->dpy, rsrc->glxWin);
     GL_ERRCHK();
+}
+
+static Bool
+is_quit_event(Display *dpy, XEvent *evt, XPointer arg)
+{
+    if (evt->type == KeyPress) {
+        KeySym ks = XLookupKeysym(&evt->xkey, 0);
+        return !IsModifierKey(ks);
+    }
+    if (evt->type == ButtonPress)
+        return True;
+    return False;
+}
+
+static void
+check_input(struct resources *rsrc)
+{
+    XEvent evt;
+    if (XCheckIfEvent(rsrc->dpy, &evt, is_quit_event, NULL))
+        exit(EXIT_SUCCESS);
 }
 
 int
@@ -526,6 +553,9 @@ main(void)
     GL_ERRCHK();
 #endif
 
+    // Keep a frame counter
+    unsigned long long time = 0;
+
     // These are the triangles that we'll render at each stage of the loop.
     // Note that we always arrange these counterclockwise, so that the
     // front of the triangle is facing us.
@@ -536,11 +566,12 @@ main(void)
         { 3, 0, 1 }
     };
     for (int i = 0; i < 4; i++) {
+        load_elements(&rsrc, triangle_indices[i], sizeof(triangle_indices[i]));
         for (int j = 0; j < FPS; j++) {
-            unsigned long long time = i * FPS + j;
+            check_input(&rsrc);
             calculate_reds(&rsrc, time);
-            draw_frame(&rsrc, triangle_indices[i], sizeof(triangle_indices[i]),
-                       time);
+            draw_frame(&rsrc, 3, time);
+            time++;
             usleep(1000000 / FPS);
         }
     }
@@ -548,19 +579,19 @@ main(void)
     // This is the triangle strip we'll render at the end of the loop.
     // Note that we need to pick the order to correctly draw the strip.
     static GLuint quad_indices[] = { 0, 1, 3, 2 };
-    for (int j = 0; j < 2 * FPS; j++) {
-        unsigned long long time = 4 * FPS + j;
+    load_elements(&rsrc, quad_indices, sizeof(quad_indices));
+    while (1) {
+        check_input(&rsrc);
         calculate_reds(&rsrc, time);
-        draw_frame(&rsrc, quad_indices, sizeof(quad_indices), time);
+        draw_frame(&rsrc, 4, time);
+        time++;
         usleep(1000000 / FPS);
     }
-
-    exit(EXIT_SUCCESS);
 }
 
 /*
  * Local Variables:
  * mode: c++
- * compile-command: "/usr/local/cuda/bin/nvcc -g -o main -lGL -lGLU -lGLEW -lX11 main.cu"
+ * compile-command: "/usr/local/cuda/bin/nvcc -g -O -Xcompiler=-Wall -o main -lGL -lGLU -lGLEW -lX11 main.cu && optirun ./main"
  * End:
  */
