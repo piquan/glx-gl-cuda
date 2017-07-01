@@ -1,9 +1,9 @@
-#version 330
+#version 430
 
-#define NREDS 1024
+#define NREDS 65536
 
 uniform float time;
-layout(std140) uniform reds_block
+layout(std140) buffer reds_block
 {
     struct {
         float red;

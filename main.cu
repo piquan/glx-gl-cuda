@@ -15,7 +15,7 @@
 
 #define FPS 30
 #define MAX_SHADER_LEN 65536
-#define NREDS 1024
+#define NREDS 65536
 
 #define WIDTH 800
 #define HEIGHT 800
@@ -36,14 +36,14 @@ struct resources
     GLXWindow glxWin;
     GLXContext context;
 
-    GLuint gl_uniform_buffer;
+    GLuint gl_shader_buffer;
     GLuint gl_time_uniform_loc;
     GLuint gl_vao;
     GLuint gl_vertex_buffer;
     GLuint gl_element_buffer;
     GLuint gl_program;
 
-    cudaGraphicsResource_t cuda_uniform_buffer;
+    cudaGraphicsResource_t cuda_shader_buffer;
 };
 
 struct reds_buffer
@@ -131,7 +131,7 @@ start_gl(struct resources *rsrc)
 
     /* Create a GLX context for OpenGL rendering */
     int context_attribs[] = {
-        GLX_CONTEXT_MAJOR_VERSION_ARB, 3,
+        GLX_CONTEXT_MAJOR_VERSION_ARB, 4,
         GLX_CONTEXT_MINOR_VERSION_ARB, 2,
         None
     };
@@ -187,8 +187,8 @@ start_cuda(struct resources *rsrc)
 static void
 initialize_cuda_resources(struct resources *rsrc)
 {
-    cudaGraphicsGLRegisterBuffer(&rsrc->cuda_uniform_buffer,
-                                 rsrc->gl_uniform_buffer,
+    cudaGraphicsGLRegisterBuffer(&rsrc->cuda_shader_buffer,
+                                 rsrc->gl_shader_buffer,
                                  cudaGraphicsRegisterFlagsWriteDiscard);
     CUDA_ERRCHK();
 }
@@ -261,17 +261,17 @@ initialize_gl_resources(struct resources *rsrc)
      * Allocate buffers
      */
 
-    // Uniform buffer
-    glGenBuffers(1, &rsrc->gl_uniform_buffer);
+    // Shader buffer
+    glGenBuffers(1, &rsrc->gl_shader_buffer);
     // The buffer we're using would be more appropriate as a 1d
-    // texture.  However, in practice, uniform buffers are more likely
-    // to be used for CUDA-OpenGL interface, so I'm using that to make
-    // better demo code.
-    glBindBuffer(GL_UNIFORM_BUFFER, rsrc->gl_uniform_buffer);
+    // texture.  However, in practice, shader storage buffers are more
+    // likely to be used for CUDA-OpenGL interface, so I'm using that
+    // to make better demo code.
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, rsrc->gl_shader_buffer);
     // This actually allocates the storage for the buffer.  The last
     // parameter determines where it will be allocated.  See also
     // https://www.khronos.org/opengl/wiki/Buffer_Object
-    glBufferData(GL_UNIFORM_BUFFER, sizeof(struct reds_buffer),
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(struct reds_buffer),
                  NULL, GL_STREAM_DRAW);
     GL_ERRCHK();
 
@@ -411,17 +411,19 @@ initialize_gl_resources(struct resources *rsrc)
     GL_ERRCHK();
 
     /*
-     * Set up uniforms
+     * Set up uniforms and shader storage
      */
 
-    // Set up the uniform block object, which is our "reds" array.
+    // Set up the shader storage block object, which is our "reds" array.
     // Get the index of the "reds" block.
-    GLuint uniform_idx = glGetUniformBlockIndex(rsrc->gl_program, "reds_block");
-    assert(uniform_idx != GL_INVALID_INDEX);
-    // Set that up as uniform buffer #0.
-    glUniformBlockBinding(rsrc->gl_program, uniform_idx, 0);
-    // Bind it to our previously-created uniform buffer.
-    glBindBufferBase(GL_UNIFORM_BUFFER, 0, rsrc->gl_uniform_buffer);
+    GLuint shader_storage_idx = glGetProgramResourceIndex(
+        rsrc->gl_program, GL_SHADER_STORAGE_BLOCK, "reds_block");
+    assert(shader_storage_idx != GL_INVALID_INDEX);
+    // Set that up as shader storage buffer #0.
+    glShaderStorageBlockBinding(rsrc->gl_program, shader_storage_idx, 0);
+    // Bind it to our previously-created shader storage buffer.
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0,
+                     rsrc->gl_shader_buffer);
     GL_ERRCHK();
 
     // Set up the "time" uniform.
@@ -435,7 +437,8 @@ calculate_reds_kernel(struct reds_buffer* reds_block,
 {
     int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_id < NREDS) {
-        float theta = sinf(float(time) / 8.0) + float(thread_id) / 64.0;
+        float theta = sinf(float(time) / 8.0) +
+            float(thread_id) * 16 / NREDS;
         reds_block->reds[thread_id].red = pow(sinf(theta), 2);
     }
 }
@@ -443,22 +446,23 @@ calculate_reds_kernel(struct reds_buffer* reds_block,
 static void
 calculate_reds(struct resources *rsrc, unsigned long long time)
 {
-    // Map the uniform buffer into CUDA space so the kernel can work on it.
-    cudaGraphicsMapResources(1, &rsrc->cuda_uniform_buffer);
+    // Map the shader storage buffer into CUDA space so the kernel can
+    // work on it.
+    cudaGraphicsMapResources(1, &rsrc->cuda_shader_buffer);
     CUDA_ERRCHK();
     // Get a CUDA-accessible pointer to the mapped buffer.
     struct reds_buffer* devptr;
     size_t devptr_size;
     cudaGraphicsResourceGetMappedPointer((void**)&devptr, &devptr_size,
-                                         rsrc->cuda_uniform_buffer);
+                                         rsrc->cuda_shader_buffer);
     CUDA_ERRCHK();
     assert(devptr_size == sizeof(struct reds_buffer));
     // Launch the kernel.
-    calculate_reds_kernel<<<16, NREDS / 16>>>(devptr, time);
+    calculate_reds_kernel<<<64, NREDS / 64>>>(devptr, time);
     CUDA_ERRCHK();
-    // Unmap the uniform buffer so it's available to OpenGL again.  (This
+    // Unmap the buffer so it's available to OpenGL again.  (This
     // includes an implicit sync point.)
-    cudaGraphicsUnmapResources(1, &rsrc->cuda_uniform_buffer);
+    cudaGraphicsUnmapResources(1, &rsrc->cuda_shader_buffer);
     CUDA_ERRCHK();
 }
 
@@ -479,9 +483,9 @@ static void
 draw_frame(struct resources *rsrc, GLsizei nvertices, unsigned long long time)
 {
     // Activate our context, shaders, and VAO.  (Not technically
-    // necessary here, since they've been activated all along, but
-    // it's always prudent to refresh the context on each drawing in a
-    // big program.)
+    // necessary here, since they've been active all along, but it's
+    // always prudent to refresh the context on each drawing in a big
+    // program.)
     glXMakeContextCurrent(rsrc->dpy, rsrc->glxWin, rsrc->glxWin, rsrc->context);
     glUseProgram(rsrc->gl_program);
     glBindVertexArray(rsrc->gl_vao);
