@@ -67,6 +67,13 @@ cuda_errchk_inner(const char* file, unsigned long line)
 #define CUDA_ERRCHK() cuda_errchk_inner(__FILE__, __LINE__)
 
 static void
+gl_debug_message(GLenum source, GLenum type, GLuint id, GLenum severity,
+                 GLsizei length, const GLchar *message, void *userParam)
+{
+    fprintf(stderr, "%s\n", message);
+}
+
+static void
 gl_errchk_inner(const char* file, unsigned long line)
 {
     GLenum err = glGetError();
@@ -133,6 +140,7 @@ start_gl(struct resources *rsrc)
     int context_attribs[] = {
         GLX_CONTEXT_MAJOR_VERSION_ARB, 4,
         GLX_CONTEXT_MINOR_VERSION_ARB, 2,
+        GLX_CONTEXT_FLAGS_ARB, GLX_CONTEXT_DEBUG_BIT_ARB,
         None
     };
     /* I can't initialize GLXEW yet because I don't have a context.
@@ -172,7 +180,16 @@ start_gl(struct resources *rsrc)
     }
     // GLEW's probes can leave an error in the context, so clear it.
     glGetError();
-    // This is kinda redundant here, but I'm leaving it.
+
+    // Whether or not debug output is available is controlled by
+    // GLX_CONTEXT_DEBUG_BIT_ARB in the context creation; see above
+    // for that.
+    // We use synchronous debugging so that the callback is called in
+    // the main thread; this relieves us of having to lock stderr.
+    glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+    glDebugMessageCallback(gl_debug_message, NULL);
+    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE,
+                          0, NULL, GL_TRUE);
     GL_ERRCHK();
 }
 
