@@ -48,10 +48,7 @@ struct resources
 
 struct reds_buffer
 {
-    struct {
-        GLfloat red;
-        GLfloat unused[3];
-    } reds[NREDS];
+    GLfloat reds[NREDS];
 };
 
 static void
@@ -456,7 +453,7 @@ calculate_reds_kernel(struct reds_buffer* reds_block,
     if (thread_id < NREDS) {
         float theta = sinf(float(time) / 8.0) +
             float(thread_id) * 16 / NREDS;
-        reds_block->reds[thread_id].red = pow(sinf(theta), 2);
+        reds_block->reds[thread_id] = pow(sinf(theta), 2);
     }
 }
 
