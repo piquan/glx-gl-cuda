@@ -4,13 +4,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+// GLEW is a library that automatically probes for and loads extension
+// functions; it makes it much easier to use GL extensions.  Since
+// OpenGL 2.0, nearly everything in OpenGL is defined in terms of an
+// extension.  Similar libraries are listed at
+// https://www.khronos.org/opengl/wiki/OpenGL_Loading_Library ;
+// epoxy is another popular choice.
+//
+// Loading GL/glew.h supercedes loading GL/gl.h.
 #include <GL/glew.h>
-// I only use one GLX extension, and I call it before my context is
-// ready, so I can't use glxew for it.  Just use basic GLX and I'll
-// get the extension myself instead of using glxew.
+
+// GLU has utility functions for OpenGL, including supporting things
+// like spheres, NURBS, matrix setup, etc.  It's mostly based around
+// OpenGL 1.3, but still sees a lot of use.  We only use it for
+// getting the error string for OpenGL error enums.
+#include <GL/glu.h>
+
+// GLX lets me connect X Windows with OpenGL.  Generally, people use
+// GLXEW (the GLX equivalent of GLEW, for managing GLX extensions),
+// but there's no point here.  I only use one GLX extension, and I
+// call it before my context is ready, so I can't use GLXEW for it.  I
+// just use basic GLX and I'll get the extension myself instead of
+// using GLXEW.
 #include <GL/glx.h>
-#include <cuda.h>
-#include <cuda_runtime_api.h>
+
+// nvcc automatically includes cuda.h and cuda_runtime_api.h, but we
+// need to load cuda_gl_interop.h ourselves to get
+// cudaGraphicsGLRegisterBuffer.  (nvcc does set the -I path
+// appropriately, though.)
 #include <cuda_gl_interop.h>
 
 #define FPS 30
@@ -23,15 +45,18 @@
 static int buffer_attributes[] = {
     GLX_DRAWABLE_TYPE, GLX_WINDOW_BIT,
     GLX_RENDER_TYPE,   GLX_RGBA_BIT,
-    GLX_DOUBLEBUFFER,  True,  /* Request a double-buffered color buffer with */
-    GLX_RED_SIZE,      1,     /* the maximum number of bits per component    */
-    GLX_GREEN_SIZE,    1, 
+    GLX_DOUBLEBUFFER,  True,
+    GLX_RED_SIZE,      1,
+    GLX_GREEN_SIZE,    1,
     GLX_BLUE_SIZE,     1,
     None
 };
 
 struct resources
 {
+    // These are the resource handles from Xlib and GLX.  We only use
+    // this struct to store the ones that we need to activate the
+    // context.
     Display *dpy;
     GLXWindow glxWin;
     GLXContext context;
